@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Attenda — AIoT Attendance Dashboard
 
 Bản project này giữ nguyên giao diện React/CSS gốc và đồng bộ backend với SQLite schema v2.
@@ -53,3 +54,6 @@ ESP32 chỉ gửi UID và event ID. UID xác định thẻ đã đăng ký, khô
 - API docs: `http://127.0.0.1:8000/docs`
 
 Chỉ dùng cấu hình demo trong môi trường local. Trước khi đưa lên LAN, đổi mật khẩu admin, `APP_SECRET`, `DEVICE_TOKEN` và chạy `python scripts/check_lan_security.py`.
+=======
+# IoT_web_dashboard
+>>>>>>> 9504780cf2a99d00626d093aa90df328ad321026
