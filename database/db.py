@@ -28,13 +28,16 @@ def connect(path=None):
     finally: conn.close()
 
 def initialize(path=None):
-    """Create/update schema while preserving legacy databases."""
+    """Create or upgrade the schema while preserving existing records."""
     import shutil
     location=Path(path) if path else db_path()
     location.parent.mkdir(parents=True,exist_ok=True)
-    with sqlite3.connect(location) as probe:
+    probe=sqlite3.connect(location)
+    try:
         version=probe.execute("PRAGMA user_version").fetchone()[0]
         tables={r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        probe.close()
     if version < 2 and "stations" in tables:
         backup=location.with_name(location.stem+"_legacy_backup"+location.suffix)
         if not backup.exists(): shutil.copy2(location,backup)
@@ -44,16 +47,10 @@ def initialize(path=None):
         temp.replace(location)
     else:
         with connect(location) as db:
-            if version < 3:
+            if version < 2:
+                # Rebuild the legacy view so its columns match the current schema.
                 db.execute("DROP VIEW IF EXISTS v_recent_scans")
-            if version < 3 and "scan_events" in tables:
-                columns={r[1] for r in db.execute("PRAGMA table_info(scan_events)")}
-                if "face_verified" not in columns:
-                    db.execute("ALTER TABLE scan_events ADD COLUMN face_verified INTEGER")
-                if "verification_status" not in columns:
-                    db.execute("ALTER TABLE scan_events ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'legacy'")
             db.executescript(SCHEMA.read_text(encoding="utf-8"))
-            db.execute("PRAGMA user_version = 3")
     return location
 
 def _migrate_legacy(old_path,new_path):
@@ -101,6 +98,5 @@ def record_scan(db,event_id:str,card_uid:str,session_id:int|None=None):
               VALUES(?,?,?,?) ON CONFLICT(session_id,student_id) DO UPDATE SET
               status=excluded.status,scan_event_id=excluded.scan_event_id,marked_at=excluded.marked_at""",
               (session_id,student_id,status,db.execute("SELECT last_insert_rowid()").fetchone()[0]))
-    db.commit()
     row=db.execute("SELECT * FROM v_recent_scans WHERE event_id=?",(event_id,)).fetchone()
     return dict(row),True

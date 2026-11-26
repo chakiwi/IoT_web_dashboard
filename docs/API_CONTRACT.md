@@ -1,86 +1,108 @@
-# API contract — NFC + Face Verification
+# API contract — Attenda v3
+
+All URLs below are relative to the FastAPI host, for example `http://127.0.0.1:8000`.
 
 ## Authentication
 
-- `POST /api/v1/auth/login`: JSON `{ "username": "admin", "password": "..." }`; returns an admin bearer token valid for 12 hours.
-- Admin endpoints use `Authorization: Bearer <access_token>`.
-- Device endpoints use `X-Device-Token: <DEVICE_TOKEN>`.
-- `GET /api/v1/health`: health check; no token required.
+- Admin login: `POST /api/v1/auth/login` with `{ "username": "admin", "password": "..." }`.
+- Dashboard requests use `Authorization: Bearer <access_token>`.
+- Device requests use `X-Device-Token: <DEVICE_TOKEN from .env>`.
+- `GET /api/v1/health` reports API and database schema status without authentication.
 
-## Admin / dashboard endpoints
+## New student registration — admin → backend
 
-- `GET /api/v1/students`: student profiles, active card UID, last successful scan time, and whether an active face template exists.
-- `POST /api/v1/students`, `PUT /api/v1/students/{id}`, `DELETE /api/v1/students/{id}`: create, update, or deactivate students/cards.
-- `GET /api/v1/scans?limit=100`: completed NFC attempts, newest first. A face mismatch is retained in `scan_events` with `face_verified=0`, but never creates an `attendance_records` row.
-- `GET /api/v1/stats`: daily successful scan statistics using Vietnam local date.
-- `GET /api/v1/config`: server and database configuration.
-- `GET /api/v1/faces`, `POST /api/v1/faces`, `DELETE /api/v1/faces/{id}`: admin face-template management.
-- `GET /api/v1/sessions`, `POST /api/v1/sessions`: attendance sessions.
-- `GET /api/v1/attendance?session_id=...`: attendance records.
-- `WS /ws/events`: authenticate with `{"type":"auth","token":"<admin-token>"}`; receives `scan.created`, `students.changed`, and `faces.changed`.
+### 1. Load blank NFC cards into inventory
 
-## Device protocol — two stages
+- `POST /api/v1/cards/inventory` — admin request:
 
-The same `event_id` must be used for both requests in one physical card tap. Generate a new unique `event_id` for every new tap.
+```json
+{ "card_uid": "AABBCCDD" }
+```
 
-### 1. ESP32 reads NFC and requests the student's embedding
+- `GET /api/v1/cards/inventory` — lists cards with `available`, `reserved`, `assigned`, or `disabled` state.
+- `DELETE /api/v1/cards/inventory/{card_uid}` — removes an `available` card; if registration history references it, the server marks it `disabled` instead of deleting historical data.
 
-`POST /api/v1/verification/start`
+The UID must be read from the actual physical card before it is entered. The backend must not invent a UID. When creating a registration, the backend reserves the oldest `available` UID and returns it to the dashboard so staff can hand out the matching physical card.
+
+### 2. Create a pending registration
+
+- `POST /api/v1/registrations` — admin request:
 
 ```json
 {
-  "event_id": "GATE-BOOT7-000001",
-  "card_uid": "A1B200000001",
-  "session_id": 1
+  "student_code": "23110001",
+  "full_name": "Nguyen Van A",
+  "class_name": "CE01"
 }
 ```
 
-`session_id` is optional. If omitted, the server selects the session only when exactly one active session exists.
+The response contains `registration_id`, the pre-reserved `card_uid`, and status `waiting_for_scan`. No row is inserted into `students` at this stage.
 
-The server validates the active NFC card and student, finds the active face template, stores a pending verification attempt (60-second expiry), and returns:
+- `GET /api/v1/registrations` — returns registrations that are waiting for scan or captured and waiting for review.
+- `GET /api/v1/registrations/{registration_id}/image` — admin-authenticated binary image response.
+- `POST /api/v1/registrations/{registration_id}/retry` — clears the previous capture and returns a captured registration to `waiting_for_scan`.
+- `POST /api/v1/registrations/{registration_id}/approve` — only a complete captured registration can be approved. This transaction creates the official `students`, `nfc_cards`, and `face_templates` rows and marks the inventory card `assigned`.
+- `POST /api/v1/registrations/{registration_id}/reject` — rejects the pending registration, clears its biometric capture, and returns the reserved card to `available`.
+
+### 3. Device uploads NFC + face capture
+
+- `POST /api/v1/registrations/capture` — device-authenticated request:
 
 ```json
 {
-  "event_id": "GATE-BOOT7-000001",
-  "student_id": 12,
-  "face_embedding": "BASE64_DATA",
+  "card_uid": "AABBCCDD",
+  "face_embedding": "BASE64_EMBEDDING_BYTES",
   "embedding_dim": 512,
-  "model_name": "...",
-  "model_version": "...",
-  "expires_at": "...Z",
-  "created": true
+  "face_image_base64": "BASE64_JPEG_BYTES",
+  "image_mime": "image/jpeg"
 }
 ```
 
-ESP32 forwards `event_id` and the embedding metadata/data to ESP32-S3-CAM. S3-CAM performs the face comparison locally.
+The server finds the pending registration by its reserved UID and stores the embedding plus decoded image bytes in `registration_queue`. `event_id` is optional for enrollment; if omitted, the server generates one. `model_name` and `model_version` are optional metadata; if omitted, the server stores `unspecified`. `embedding_dim` defaults to 512 and `image_mime` defaults to `image/jpeg`. Supported image MIME types are JPEG, PNG, and WebP; maximum decoded image size is 5 MB. Repeated upload with the same `event_id` and UID is idempotent. If no event ID is sent, a repeat upload for a card whose registration is already captured returns the existing captured registration without overwriting it. The browser loads the stored image from the authenticated image endpoint.
 
-### 2. ESP32 sends the S3-CAM result
+## Daily attendance — device → backend
 
-`POST /api/v1/verification/complete`
+Attendance is a separate process from new student registration. NFC alone never writes an attendance record.
+
+### 1. Start verification after NFC read
+
+- `POST /api/v1/verification/start` — device request:
 
 ```json
-{
-  "event_id": "GATE-BOOT7-000001",
-  "face_result": 1
-}
+{ "event_id": "SCAN-0001", "card_uid": "AABBCCDD", "session_id": 1 }
 ```
 
-Use `face_result: 1` for a match and `face_result: 0` for no match. The server records the scan event after receiving the face result. A successful result also creates/updates attendance; a failed result is logged with `face_verified=0` but never marks attendance.
+`session_id` is optional. If omitted, the server associates the only active session when exactly one exists. For a valid active card with an active face template, the server returns `status: "pending"`, the student's ID, and the stored face embedding. Other statuses include `unregistered`, `inactive_card`, and `no_face_template`.
 
-### Important behavior
+### 2. Complete verification after the camera comparison
 
-- `event_id` links the NFC request and final face result. Do not generate a second ID for the face result.
-- A pending attempt expires after 60 seconds.
-- Repeating `start` with the same event ID and UID while pending returns the same pending attempt; a different UID or already closed attempt returns `409`.
-- Repeating `complete` after successful completion returns `created: false`; it does not create another scan or attendance record.
-- `POST /api/v1/scans` is disabled (`410 Gone`) because it bypasses face verification.
-- A card without an active face template cannot start verification.
-- Device token authenticates the ESP32 request. It does not cryptographically prove that the reported face result came from the S3-CAM; protect the device network/token accordingly.
+- `POST /api/v1/verification/complete` — device request:
 
-## Simulator
-
-```bash
-python simulator/send_scan.py --uid A1B200000001 --face-result 1
+```json
+{ "event_id": "SCAN-0001", "face_result": true }
 ```
 
-`--face-result` simulates the S3-CAM result; it does not run an actual face-recognition model.
+The same `event_id` from the first request must be reused. The server records attendance only when the attempt is pending, has not expired, the card/student/template are still active, and `face_result` is true. A false result is stored as `face_mismatch`. Attempts expire after 90 seconds. Repeated completion requests do not create duplicate attendance.
+
+The old direct `POST /api/v1/scans` endpoint is disabled with HTTP 410 so NFC-only requests cannot bypass face verification.
+
+## Other admin endpoints
+
+- `GET /api/v1/students`, `PUT /api/v1/students/{id}`, `DELETE /api/v1/students/{id}` — official student directory and deactivation. Direct `POST /api/v1/students` is disabled; new students must use the registration queue.
+- `GET /api/v1/scans?limit=100` — daily verification attempts and legacy scan records, newest first.
+- `GET /api/v1/stats` — counts in Vietnam local time.
+- `GET /api/v1/faces`, `POST /api/v1/faces`, `DELETE /api/v1/faces/{id}` — face-template administration.
+- `GET /api/v1/sessions`, `POST /api/v1/sessions` — attendance sessions.
+- `GET /api/v1/attendance?session_id=1` — attendance records.
+- `GET /api/v1/config` — server and database configuration.
+- `WS /ws/events` — after connection, send `{"type":"auth","token":"<admin-token>"}`. Events include `scan.created`, `students.changed`, `registrations.changed`, `cards.changed`, and `attendance.changed`.
+
+## Common errors
+
+- `401`: missing or invalid admin/device token.
+- `404`: unknown registration, image, event, or student.
+- `409`: duplicate UID/student code, card not available, invalid registration state, or conflicting event ID.
+- `410`: an obsolete direct NFC-only write route is disabled.
+- `422`: invalid payload, UID, Base64, image type, or image signature.
+
+OpenAPI documentation: `http://127.0.0.1:8000/docs`.

@@ -1,9 +1,9 @@
 # Attenda frontend
 
-Giao diện đã chốt được lấy lại từ bản `attenda-frontend.zip` ban đầu; giữ nguyên phần CSS và hệ layout. Các trang đã nối REST API thực của FastAPI, WebSocket, form quản trị, CSV và đăng nhập.
+React/TypeScript dashboard connected to the FastAPI v3 endpoints. The existing dashboard structure and visual language are retained; additions include the new-registration queue, the reserved-card display, face-image review, and blank NFC-card inventory under Settings.
 
-Development: `npm.cmd install` (lần đầu), `npm.cmd run dev` (Vite 5173, proxy `/api` + `/ws` về FastAPI localhost:8000).
+Development on Windows: `npm.cmd install` (first run), then `npm.cmd run dev` (Vite on 5173; API/WebSocket proxy to FastAPI on 8000).
 
-Build production: `npm.cmd run build`, FastAPI phục vụ file trong `frontend/dist` khi chạy `start.bat`.
+Production build: `npm.cmd run build`. FastAPI serves `frontend/dist` when `start.bat` is used.
 
-Không truy vấn SQLite trực tiếp từ React, không lưu device tokens ở frontend, không có AI/khuôn mặt trong phiên bản này.
+The browser uses admin bearer authentication for protected API requests. Device tokens are not stored in frontend code.

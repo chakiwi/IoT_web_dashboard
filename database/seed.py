@@ -1,4 +1,4 @@
-"""Idempotent fictional demo data for the v2 schema."""
+"""Idempotent fictional demo students/cards. No NFC-only demo attendance is seeded."""
 from datetime import datetime,timedelta,timezone
 from .db import connect,initialize,db_path,record_scan
 
@@ -9,7 +9,7 @@ PEOPLE=[
 ('23110007','Bùi Minh Khang','CE03'),('23110008','Đỗ Quỳnh Như','CE01'),
 ('23110009','Ngô Gia Phát','CE02'),('23110010','Hoàng Ngọc Lan','CE03'),
 ('23110011','Phan Tuấn Kiệt','CE01'),('23110012','Lý Minh Thư','CE02')]
-def seed(include_scans=True):
+def seed(include_scans=False):
     initialize()
     with connect() as db:
         for code,name,cls in PEOPLE:

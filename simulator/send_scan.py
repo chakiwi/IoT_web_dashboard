@@ -1,30 +1,69 @@
-"""Simulate the ESP32 NFC request and the ESP32-S3-CAM face result."""
-import argparse,json,os,sys,urllib.request,urllib.error,uuid
+"""Simulate one two-stage attendance check-in against the Attenda API."""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
-ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT))
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv
-load_dotenv(ROOT/'.env')
-def post(server,path,body):
-    req=urllib.request.Request(server.rstrip('/')+path,data=json.dumps(body).encode(),
-      headers={'Content-Type':'application/json','X-Device-Token':os.getenv('DEVICE_TOKEN','')},method='POST')
-    with urllib.request.urlopen(req,timeout=8) as r:return json.loads(r.read())
-def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('--server',default='http://127.0.0.1:8000')
-    ap.add_argument('--uid',default='A1B200000001')
-    ap.add_argument('--event-id',default=None)
-    ap.add_argument('--session-id',type=int,default=None)
-    ap.add_argument('--face-result',type=int,choices=(0,1),default=1,help='Simulated ESP32-S3-CAM result: 1=match, 0=no match')
-    args=ap.parse_args()
-    event_id=args.event_id or 'SIM-'+uuid.uuid4().hex
-    body={'event_id':event_id,'card_uid':args.uid}
-    if args.session_id is not None:body['session_id']=args.session_id
+
+load_dotenv(ROOT / '.env')
+
+
+def post_json(server: str, endpoint: str, payload: dict) -> dict:
+    request = urllib.request.Request(
+        server.rstrip('/') + endpoint,
+        data=json.dumps(payload).encode(),
+        headers={
+            'Content-Type': 'application/json',
+            'X-Device-Token': os.getenv('DEVICE_TOKEN', ''),
+        },
+        method='POST',
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Simulate NFC then face verification')
+    parser.add_argument('--server', default='http://127.0.0.1:8000')
+    parser.add_argument('--uid', required=True, help='UID of an approved NFC card')
+    parser.add_argument('--event-id', default=None)
+    parser.add_argument('--session-id', type=int, default=None)
+    parser.add_argument('--face-result', choices=('match', 'mismatch'), default='match')
+    args = parser.parse_args()
+
+    event_id = args.event_id or 'SIM-' + uuid.uuid4().hex.upper()
+    start_payload = {'event_id': event_id, 'card_uid': args.uid}
+    if args.session_id is not None:
+        start_payload['session_id'] = args.session_id
+
     try:
-        start=post(args.server,'/api/v1/verification/start',body)
-        print('NFC accepted; embedding received for student:',start['student_id'])
-        result=post(args.server,'/api/v1/verification/complete',{'event_id':event_id,'face_result':bool(args.face_result)})
-        print(json.dumps(result,ensure_ascii=False,indent=2))
-    except urllib.error.HTTPError as e:print('HTTP',e.code,e.read().decode());raise SystemExit(1)
-    except OSError as e:print('Cannot connect to backend:',e);raise SystemExit(1)
-if __name__=='__main__':main()
+        started = post_json(args.server, '/api/v1/verification/start', start_payload)
+        print('NFC stage:')
+        print(json.dumps(started, ensure_ascii=False, indent=2))
+        if started.get('status') != 'pending':
+            print('Attendance was not recorded. Face verification cannot continue.')
+            return
+
+        completed = post_json(args.server, '/api/v1/verification/complete', {
+            'event_id': event_id,
+            'face_result': args.face_result == 'match',
+        })
+        print('\nFace stage:')
+        print(json.dumps(completed, ensure_ascii=False, indent=2))
+    except urllib.error.HTTPError as error:
+        print('HTTP', error.code, error.read().decode(errors='replace'))
+        raise SystemExit(1)
+    except OSError as error:
+        print('Could not connect to backend:', error)
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()
