@@ -1,14 +1,13 @@
-<<<<<<< HEAD
 # Attenda — AIoT Attendance Dashboard
 
-Bản project này giữ nguyên giao diện React/CSS gốc và đồng bộ backend với SQLite schema v2.
+Bản project này giữ nguyên giao diện React/CSS gốc và đồng bộ backend với SQLite schema v3 và luồng xác minh NFC + khuôn mặt hai giai đoạn.
 
 ## Thành phần
 
 - Frontend: React + TypeScript + Vite
 - Backend: FastAPI
 - Database: SQLite
-- Thiết bị: ESP32 / PN532 qua Wi-Fi HTTP hoặc USB Serial bridge
+- Thiết bị: ESP32 + PN532, ESP32-S3-CAM qua Wi-Fi hoặc USB Serial bridge tùy cấu hình
 
 ## Cài đặt trên Windows
 
@@ -25,27 +24,27 @@ Tài khoản demo mặc định sau khi tạo `.env` từ `.env.example`:
 
 Nếu đã có file `.env` từ bản cũ, `setup.bat` không ghi đè file đó. Kiểm tra `ADMIN_USERNAME` và `ADMIN_PASSWORD` trong `.env` khi đăng nhập không thành công.
 
-## Database schema v2
+## Database schema v3
 
 - `students`: hồ sơ sinh viên, không lưu email.
 - `nfc_cards`: UID thẻ NFC gắn với sinh viên.
 - `face_templates`: nơi lưu embedding khuôn mặt (chưa thực hiện nhận diện trực tiếp bằng camera).
 - `attendance_sessions`: buổi điểm danh.
-- `scan_events`: sự kiện quét thẻ NFC.
+- `verification_attempts`: trạng thái chờ/kết quả của mỗi lần xác minh, liên kết bằng `event_id`.
+- `scan_events`: lưu kết quả cuối cùng của lượt xác minh; có thể lưu lượt không khớp khuôn mặt để tra cứu, nhưng không tính là điểm danh.
 - `attendance_records`: kết quả điểm danh theo sinh viên và buổi.
 
-Không còn bảng `stations`. API có một endpoint tương thích đọc-only `/api/v1/stations` để dashboard gốc không lỗi khi tải dữ liệu; endpoint này trả danh sách rỗng. Việc quản lý trạm không phải một phần của schema v2.
-
-Khi chạy lần đầu, backend tự nâng database đã có lên schema v2 và giữ lại dữ liệu sinh viên, thẻ, lượt quét. Với database cũ có bảng `stations`, quá trình nâng cấp tạo file backup `_legacy_backup.db` trước khi chuyển đổi.
+Không còn chức năng quản lý `stations` hoặc API heartbeat. Backend tự nâng database cũ lên schema v3; trước khi chuyển đổi database legacy có bảng `stations`, sẽ tạo file backup `_legacy_backup.db`. Database v2 được bổ sung cột xác minh và bảng `verification_attempts` mà không xóa dữ liệu cũ.
 
 ## Thiết bị / simulator
 
 - Khóa thiết bị dùng chung: `DEVICE_TOKEN` trong `.env`.
 - Firmware: cập nhật `DEVICE_TOKEN` trong `firmware/include/config.h` trùng với `.env`.
-- Gửi lượt quét mẫu: `python simulator/send_scan.py --uid A1B200000001`.
+- Mô phỏng toàn bộ hai giai đoạn: `python simulator/send_scan.py --uid A1B200000001 --face-result 1`.
+- `--face-result 0` mô phỏng khuôn mặt không khớp; lượt này không được ghi nhận điểm danh.
 - USB Serial bridge: `python simulator/serial_bridge.py --port COM5` (đổi COM5 theo máy).
 
-ESP32 chỉ gửi UID và event ID. UID xác định thẻ đã đăng ký, không chứng minh danh tính người đang cầm thẻ.
+ESP32 gửi UID + event ID để lấy embedding; sau khi ESP32-S3-CAM so sánh khuôn mặt, ESP32 gửi kết quả 0/1 với cùng event ID. Server chỉ ghi điểm danh nếu cả hai bước hợp lệ.
 
 ## Kiểm tra
 
@@ -54,6 +53,3 @@ ESP32 chỉ gửi UID và event ID. UID xác định thẻ đã đăng ký, khô
 - API docs: `http://127.0.0.1:8000/docs`
 
 Chỉ dùng cấu hình demo trong môi trường local. Trước khi đưa lên LAN, đổi mật khẩu admin, `APP_SECRET`, `DEVICE_TOKEN` và chạy `python scripts/check_lan_security.py`.
-=======
-# IoT_web_dashboard
->>>>>>> 9504780cf2a99d00626d093aa90df328ad321026

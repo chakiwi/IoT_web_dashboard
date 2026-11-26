@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
-from database.db import connect, initialize, normalize_uid, record_scan, utc_now
+from database.db import connect, initialize, normalize_uid, utc_now
 from database.seed import seed
 
 # Vietnam uses UTC+07:00 year-round; fixed offset avoids Windows tzdata dependency.
@@ -56,13 +56,22 @@ class Student(BaseModel):
     @field_validator('card_uid')
     @classmethod
     def uid(cls,v): return normalize_uid(v) if v and v.strip() else None
-class Scan(BaseModel):
+class VerificationStart(BaseModel):
     event_id:str=Field(min_length=1,max_length=100)
     card_uid:str=Field(min_length=2,max_length=40)
     session_id:int|None=None
+    @field_validator('event_id')
+    @classmethod
+    def clean_event_id(cls,v): return v.strip()
     @field_validator('card_uid')
     @classmethod
     def uid(cls,v): return normalize_uid(v)
+class VerificationComplete(BaseModel):
+    event_id:str=Field(min_length=1,max_length=100)
+    face_result:bool
+    @field_validator('event_id')
+    @classmethod
+    def clean_event_id(cls,v): return v.strip()
 class Face(BaseModel):
     face_id:str
     student_id:int
@@ -130,10 +139,8 @@ def student_write(db,sid,x):
 
 @app.get('/api/v1/students')
 def get_students(_:str=Depends(admin)):
-    return [dict(r, email=None, last_station_id=None) for r in rows('''SELECT s.id,s.full_name,s.student_code,s.class_name,s.is_active,c.uid AS card_uid,c.is_active AS card_active,
-      (SELECT MAX(received_at) FROM scan_events e WHERE e.student_id=s.id) AS last_scan_at,
-      EXISTS(SELECT 1 FROM face_templates f WHERE f.student_id=s.id AND f.is_active=1) AS has_face
-      FROM students s LEFT JOIN nfc_cards c ON c.student_id=s.id AND c.is_active=1 ORDER BY s.full_name''')]
+    return rows('''SELECT s.id,s.full_name,s.student_code,s.class_name,s.is_active,c.uid AS card_uid
+      FROM students s LEFT JOIN nfc_cards c ON c.student_id=s.id AND c.is_active=1 ORDER BY s.full_name''')
 @app.post('/api/v1/students',status_code=201)
 async def add_student(x:Student,_:str=Depends(admin)):
     try:
@@ -158,41 +165,119 @@ async def delete_student(sid:int,_:str=Depends(admin)):
             db.execute('UPDATE face_templates SET is_active=0 WHERE student_id=?',(sid,))
     await hub.send('students.changed'); return {'message':'Đã vô hiệu hóa sinh viên'}
 
-async def scan_save(x):
-    try:
-        with connect() as db:
-            with db:
-                session_id=x.session_id
-                if session_id is None:
-                    active=db.execute('SELECT id FROM attendance_sessions WHERE is_active=1 ORDER BY id DESC LIMIT 2').fetchall()
-                    if len(active)==1: session_id=active[0]['id']
-                result,created=record_scan(db,x.event_id,x.card_uid,session_id)
-    except ValueError as e: raise HTTPException(409 if 'event_id' in str(e) else 400,str(e)) from e
-    except sqlite3.IntegrityError as e: raise HTTPException(409,'Dữ liệu quét xung đột') from e
-    if created: await hub.send('scan.created',{'event_id':x.event_id})
-    return {'created':created,'event_id':x.event_id,'result':result['result'],'scan':result}
-@app.post('/api/v1/scans',status_code=201)
-async def ingest(x:Scan,x_device_token:str|None=Header(default=None)):
-    device(x_device_token); return await scan_save(x)
+def resolve_session(db, session_id):
+    if session_id is not None:
+        session=db.execute('SELECT id,is_active FROM attendance_sessions WHERE id=?',(session_id,)).fetchone()
+        if not session or not session['is_active']:
+            raise HTTPException(409,'Buổi điểm danh không tồn tại hoặc đã đóng')
+        return session_id
+    active=db.execute('SELECT id FROM attendance_sessions WHERE is_active=1 ORDER BY id DESC LIMIT 2').fetchall()
+    return active[0]['id'] if len(active)==1 else None
 
-@app.get('/api/v1/stations')
-def get_legacy_stations(_:str=Depends(admin)):
-    # Compatibility for the original dashboard bundle. Station entities were
-    # removed from schema v2; device heartbeat is not persisted as a station.
-    return []
+@app.post('/api/v1/verification/start')
+def start_verification(x:VerificationStart,x_device_token:str|None=Header(default=None)):
+    device(x_device_token)
+    now=datetime.now(timezone.utc)
+    now_text=now.isoformat(timespec='seconds').replace('+00:00','Z')
+    expires=(now+timedelta(seconds=60)).isoformat(timespec='seconds').replace('+00:00','Z')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        existing=db.execute('SELECT * FROM verification_attempts WHERE event_id=?',(x.event_id,)).fetchone()
+        if not existing and db.execute('SELECT 1 FROM scan_events WHERE event_id=?',(x.event_id,)).fetchone():
+            raise HTTPException(409,'event_id đã tồn tại trong lịch sử quét')
+        if existing:
+            if existing['card_uid']!=x.card_uid:
+                raise HTTPException(409,'event_id đã được dùng với UID khác')
+            if existing['state']=='pending' and existing['expires_at']>now_text:
+                face=db.execute('SELECT face_embedding,embedding_dim,model_name,model_version FROM face_templates WHERE student_id=? AND is_active=1 ORDER BY updated_at DESC,id DESC LIMIT 1',(existing['student_id'],)).fetchone()
+                if face:
+                    db.commit()
+                    return {'event_id':x.event_id,'student_id':existing['student_id'],'face_embedding':face['face_embedding'],'embedding_dim':face['embedding_dim'],'model_name':face['model_name'],'model_version':face['model_version'],'expires_at':existing['expires_at'],'created':False}
+            raise HTTPException(409,'event_id đã được xử lý hoặc không còn hiệu lực')
+        card=db.execute('''SELECT c.id AS card_id,c.student_id,s.is_active AS student_active,
+            f.face_embedding,f.embedding_dim,f.model_name,f.model_version
+            FROM nfc_cards c JOIN students s ON s.id=c.student_id
+            LEFT JOIN face_templates f ON f.student_id=s.id AND f.is_active=1
+            WHERE c.uid=? AND c.is_active=1 ORDER BY f.updated_at DESC,f.id DESC LIMIT 1''',(x.card_uid,)).fetchone()
+        if not card:
+            raise HTTPException(404,'Thẻ NFC chưa đăng ký hoặc đã bị vô hiệu hóa')
+        if not card['student_active']:
+            raise HTTPException(403,'Sinh viên đã bị vô hiệu hóa')
+        if not card['face_embedding']:
+            raise HTTPException(409,'Sinh viên chưa có dữ liệu khuôn mặt hoạt động')
+        session_id=resolve_session(db,x.session_id)
+        db.execute('''INSERT INTO verification_attempts(event_id,session_id,card_uid,card_id,student_id,state,created_at,expires_at)
+            VALUES(?,?,?,?,?,'pending',?,?)''',(x.event_id,session_id,x.card_uid,card['card_id'],card['student_id'],now_text,expires))
+        db.commit()
+        return {'event_id':x.event_id,'student_id':card['student_id'],'face_embedding':card['face_embedding'],'embedding_dim':card['embedding_dim'],'model_name':card['model_name'],'model_version':card['model_version'],'expires_at':expires,'created':True}
+
+@app.post('/api/v1/verification/complete')
+async def complete_verification(x:VerificationComplete,x_device_token:str|None=Header(default=None)):
+    device(x_device_token)
+    now=datetime.now(timezone.utc)
+    now_text=now.isoformat(timespec='seconds').replace('+00:00','Z')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        attempt=db.execute('SELECT * FROM verification_attempts WHERE event_id=?',(x.event_id,)).fetchone()
+        if not attempt:
+            raise HTTPException(404,'Không tìm thấy lần xác minh NFC tương ứng')
+        if attempt['state']=='completed':
+            db.commit()
+            return {'event_id':x.event_id,'verified':True,'created':False,'message':'Lần điểm danh này đã được ghi nhận'}
+        if attempt['state']!='pending':
+            raise HTTPException(409,'Lần xác minh đã kết thúc hoặc thất bại')
+        if attempt['expires_at']<=now_text:
+            db.execute("UPDATE verification_attempts SET state='expired',completed_at=? WHERE event_id=?",(now_text,x.event_id))
+            db.commit()
+            raise HTTPException(410,'Lần xác minh đã hết thời gian chờ; vui lòng quét lại thẻ')
+        if not x.face_result:
+            db.execute('''INSERT INTO scan_events(event_id,session_id,card_uid,card_id,student_id,result,face_verified,verification_status,occurred_at)
+                VALUES(?,?,?,?,?,'recognized',0,'face_mismatch',?)''',
+                (x.event_id,attempt['session_id'],attempt['card_uid'],attempt['card_id'],attempt['student_id'],now_text))
+            db.execute("UPDATE verification_attempts SET state='failed',face_result=0,completed_at=? WHERE event_id=?",(now_text,x.event_id))
+            db.commit()
+            await hub.send('verification.failed',{'event_id':x.event_id})
+            return {'event_id':x.event_id,'verified':False,'created':True,'message':'Không xác minh được khuôn mặt'}
+        valid=db.execute('''SELECT c.is_active AS card_active,s.is_active AS student_active
+            FROM nfc_cards c JOIN students s ON s.id=c.student_id
+            WHERE c.id=? AND c.student_id=? AND c.uid=?''',(attempt['card_id'],attempt['student_id'],attempt['card_uid'])).fetchone()
+        if not valid or not valid['card_active'] or not valid['student_active']:
+            db.execute("UPDATE verification_attempts SET state='failed',face_result=1,completed_at=? WHERE event_id=?",(now_text,x.event_id))
+            db.commit()
+            raise HTTPException(409,'Thẻ hoặc hồ sơ sinh viên đã bị vô hiệu hóa trong lúc xác minh')
+        cur=db.execute('''INSERT INTO scan_events(event_id,session_id,card_uid,card_id,student_id,result,face_verified,verification_status,occurred_at)
+            VALUES(?,?,?,?,?,'recognized',1,'verified',?)''',(x.event_id,attempt['session_id'],attempt['card_uid'],attempt['card_id'],attempt['student_id'],now_text))
+        scan_id=cur.lastrowid
+        if attempt['session_id'] is not None:
+            session=db.execute('SELECT starts_at,ends_at,is_active FROM attendance_sessions WHERE id=?',(attempt['session_id'],)).fetchone()
+            if session and session['is_active']:
+                status='late' if now_text>session['starts_at'] else 'present'
+                db.execute('''INSERT INTO attendance_records(session_id,student_id,status,scan_event_id)
+                    VALUES(?,?,?,?) ON CONFLICT(session_id,student_id) DO UPDATE SET
+                    status=excluded.status,scan_event_id=excluded.scan_event_id,marked_at=excluded.marked_at''',
+                    (attempt['session_id'],attempt['student_id'],status,scan_id))
+        db.execute("UPDATE verification_attempts SET state='completed',face_result=1,completed_at=? WHERE event_id=?",(now_text,x.event_id))
+        db.commit()
+        result=db.execute('SELECT * FROM v_recent_scans WHERE event_id=?',(x.event_id,)).fetchone()
+    await hub.send('scan.created',{'event_id':x.event_id})
+    return {'event_id':x.event_id,'verified':True,'created':True,'scan':dict(result)}
+
+@app.post('/api/v1/scans')
+def legacy_scan_disabled():
+    raise HTTPException(410,'Endpoint cũ đã bị khóa. Hãy dùng /api/v1/verification/start và /complete để xác minh NFC + khuôn mặt.')
 
 @app.get('/api/v1/scans')
 def get_scans(limit:int=Query(100,ge=1,le=500),_:str=Depends(admin)):
-    return [dict(r, station_id='LOCAL_GATEWAY', station_name='Thiết bị NFC', station_location='Cổng điểm danh') for r in rows('SELECT e.id, v.* FROM v_recent_scans v JOIN scan_events e ON e.event_id=v.event_id ORDER BY v.received_at DESC LIMIT ?',(limit,))]
+    return rows('SELECT e.id,v.* FROM v_recent_scans v JOIN scan_events e ON e.event_id=v.event_id ORDER BY v.received_at DESC LIMIT ?',(limit,))
 @app.get('/api/v1/stats')
 def get_stats(_:str=Depends(admin)):
     today=datetime.now(VN_TZ).date().isoformat()
     with connect() as db:
         n=db.execute('SELECT COUNT(*) FROM students WHERE is_active=1').fetchone()[0]
-        scans=db.execute('SELECT COUNT(*) FROM scan_events WHERE substr(received_at,1,10)=?',(today,)).fetchone()[0]
-        ok=db.execute("SELECT COUNT(*) FROM scan_events WHERE result='recognized' AND substr(received_at,1,10)=?",(today,)).fetchone()[0]
+        scans=db.execute('SELECT COUNT(*) FROM verification_attempts WHERE substr(created_at,1,10)=?',(today,)).fetchone()[0]
+        ok=db.execute("SELECT COUNT(*) FROM verification_attempts WHERE state='completed' AND substr(created_at,1,10)=?",(today,)).fetchone()[0]
         faces=db.execute('SELECT COUNT(*) FROM face_templates WHERE is_active=1').fetchone()[0]
-    return {'students':n,'scans_today':scans,'recognized_today':ok,'flagged_today':scans-ok,'registered_rate':round(ok*100/scans,1) if scans else 0,'face_templates':faces,'stations_online':0,'stations_total':0,'server_time':utc_now()}
+    return {'students':n,'scans_today':scans,'recognized_today':ok,'flagged_today':scans-ok,'registered_rate':round(ok*100/scans,1) if scans else 0,'face_templates':faces,'server_time':utc_now()}
 
 @app.get('/api/v1/faces')
 def get_faces(_:str=Depends(admin)):

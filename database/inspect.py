@@ -1,8 +1,8 @@
 from .db import connect
 if __name__=='__main__':
     with connect() as db:
-        for name in ('students','nfc_cards','stations','scan_events'):
+        for name in ('students','nfc_cards','face_templates','attendance_sessions','verification_attempts','scan_events','attendance_records'):
             print(name, db.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0])
         print('Recent events:')
-        for row in db.execute('SELECT station_name,full_name,card_uid,result,occurred_at FROM v_recent_scans ORDER BY received_at DESC LIMIT 10'):
+        for row in db.execute('SELECT full_name,card_uid,result,verification_status,occurred_at FROM v_recent_scans ORDER BY received_at DESC LIMIT 10'):
             print(dict(row))

@@ -24,9 +24,28 @@ class ApiTest(unittest.TestCase):
  def test_student_and_scan(self):
   x={'full_name':'Test Student','student_code':'99900001','class_name':'TEST','card_uid':'AABBCCDD','is_active':True}
   r=self.c.post('/api/v1/students',json=x,headers=self.h);self.assertEqual(r.status_code,201,r.text)
-  scan=self.c.post('/api/v1/scans',json={'event_id':'EV-1','card_uid':'AABBCCDD'},headers={'X-Device-Token':'test-device-token-long-enough'})
-  self.assertEqual(scan.status_code,201,scan.text);self.assertEqual(scan.json()['result'],'recognized')
-  self.assertEqual(self.c.get('/api/v1/scans',headers=self.h).status_code,200)
+  import base64
+  face={'face_id':'FACE-EV-1','student_id':r.json()['id'],'face_embedding':base64.b64encode(b'1234').decode(),'embedding_dim':1,'model_name':'test','model_version':'1'}
+  self.assertEqual(self.c.post('/api/v1/faces',json=face,headers=self.h).status_code,201)
+  device={'X-Device-Token':'test-device-token-long-enough'}
+  start=self.c.post('/api/v1/verification/start',json={'event_id':'EV-1','card_uid':'AABBCCDD'},headers=device)
+  self.assertEqual(start.status_code,200,start.text);self.assertEqual(start.json()['event_id'],'EV-1')
+  self.assertEqual(len(self.c.get('/api/v1/scans',headers=self.h).json()),0)
+  complete=self.c.post('/api/v1/verification/complete',json={'event_id':'EV-1','face_result':True},headers=device)
+  self.assertEqual(complete.status_code,200,complete.text);self.assertTrue(complete.json()['verified'])
+  self.assertEqual(len(self.c.get('/api/v1/scans',headers=self.h).json()),1)
+  duplicate=self.c.post('/api/v1/verification/complete',json={'event_id':'EV-1','face_result':True},headers=device)
+  self.assertEqual(duplicate.status_code,200);self.assertFalse(duplicate.json()['created'])
+  failed_start=self.c.post('/api/v1/verification/start',json={'event_id':'EV-2','card_uid':'AABBCCDD'},headers=device)
+  self.assertEqual(failed_start.status_code,200,failed_start.text)
+  failed=self.c.post('/api/v1/verification/complete',json={'event_id':'EV-2','face_result':False},headers=device)
+  self.assertEqual(failed.status_code,200);self.assertFalse(failed.json()['verified'])
+  events=self.c.get('/api/v1/scans',headers=self.h).json()
+  self.assertEqual(len(events),2);self.assertEqual(events[0]['face_verified'],0)
+  attendance=self.c.get('/api/v1/attendance',headers=self.h).json()
+  self.assertEqual(len(attendance),0)
+  old=self.c.post('/api/v1/scans',json={'event_id':'EV-OLD','card_uid':'AABBCCDD'},headers=device)
+  self.assertEqual(old.status_code,410)
  def test_faces(self):
   student=self.c.get('/api/v1/students',headers=self.h).json()[0]
   import base64

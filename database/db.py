@@ -28,7 +28,7 @@ def connect(path=None):
     finally: conn.close()
 
 def initialize(path=None):
-    """Create v2 schema; preserve a legacy database backup before replacing it."""
+    """Create/update schema while preserving legacy databases."""
     import shutil
     location=Path(path) if path else db_path()
     location.parent.mkdir(parents=True,exist_ok=True)
@@ -44,10 +44,16 @@ def initialize(path=None):
         temp.replace(location)
     else:
         with connect(location) as db:
-            if version < 2:
-                # Rebuild the legacy view so its columns match the v2 contract.
+            if version < 3:
                 db.execute("DROP VIEW IF EXISTS v_recent_scans")
+            if version < 3 and "scan_events" in tables:
+                columns={r[1] for r in db.execute("PRAGMA table_info(scan_events)")}
+                if "face_verified" not in columns:
+                    db.execute("ALTER TABLE scan_events ADD COLUMN face_verified INTEGER")
+                if "verification_status" not in columns:
+                    db.execute("ALTER TABLE scan_events ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'legacy'")
             db.executescript(SCHEMA.read_text(encoding="utf-8"))
+            db.execute("PRAGMA user_version = 3")
     return location
 
 def _migrate_legacy(old_path,new_path):

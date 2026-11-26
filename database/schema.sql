@@ -52,9 +52,25 @@ CREATE TABLE IF NOT EXISTS scan_events (
  card_id INTEGER REFERENCES nfc_cards(id) ON DELETE SET NULL,
  student_id INTEGER REFERENCES students(id) ON DELETE SET NULL,
  result TEXT NOT NULL CHECK(result IN ('recognized','unregistered','inactive_card')),
+ face_verified INTEGER CHECK(face_verified IN (0,1) OR face_verified IS NULL),
+ verification_status TEXT NOT NULL DEFAULT 'legacy',
  occurred_at TEXT NOT NULL,
  received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+CREATE TABLE IF NOT EXISTS verification_attempts (
+ event_id TEXT PRIMARY KEY,
+ session_id INTEGER REFERENCES attendance_sessions(id) ON DELETE SET NULL,
+ card_uid TEXT NOT NULL,
+ card_id INTEGER REFERENCES nfc_cards(id) ON DELETE SET NULL,
+ student_id INTEGER REFERENCES students(id) ON DELETE SET NULL,
+ state TEXT NOT NULL CHECK(state IN ('pending','completed','failed','expired')),
+ face_result INTEGER CHECK(face_result IN (0,1) OR face_result IS NULL),
+ created_at TEXT NOT NULL,
+ expires_at TEXT NOT NULL,
+ completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_verification_state_expiry ON verification_attempts(state,expires_at);
+
 CREATE INDEX IF NOT EXISTS ix_scans_time ON scan_events(occurred_at DESC);
 CREATE INDEX IF NOT EXISTS ix_scans_student_time ON scan_events(student_id,occurred_at DESC);
 
@@ -70,7 +86,7 @@ CREATE TABLE IF NOT EXISTS attendance_records (
 
 CREATE VIEW IF NOT EXISTS v_recent_scans AS
  SELECT e.event_id,e.occurred_at,e.received_at,e.session_id,e.card_uid,e.result,
-        s.student_code,s.full_name,s.class_name
+        s.student_code,s.full_name,s.class_name,e.face_verified,e.verification_status
  FROM scan_events e LEFT JOIN students s ON e.student_id=s.id;
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
