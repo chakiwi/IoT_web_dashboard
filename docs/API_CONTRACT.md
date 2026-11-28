@@ -106,3 +106,12 @@ The old direct `POST /api/v1/scans` endpoint is disabled with HTTP 410 so NFC-on
 - `422`: invalid payload, UID, Base64, image type, or image signature.
 
 OpenAPI documentation: `http://127.0.0.1:8000/docs`.
+
+### Attendance session requirements
+
+- A session is eligible only when `is_active = true` and the current time is inside `starts_at <= now < ends_at`.
+- The device may omit `session_id` only when exactly one eligible session exists. If there are no eligible sessions or more than one, the API returns HTTP 409; when multiple sessions overlap, send the intended `session_id`.
+- Timestamp values with an explicit timezone are normalized to UTC. A timestamp without a timezone is interpreted as Asia/Ho_Chi_Minh local time.
+- The first 10 minutes after `starts_at` count as `present`; successful verification after that grace period counts as `late`.
+- The session is checked both when verification starts and when the face result completes. If it closes or ends in between, the attempt expires and no attendance row is written.
+

@@ -1,4 +1,4 @@
-# Test plan — Attenda v3
+# Test plan — Attenda v4 (schema v3)
 
 ## Automated backend tests
 
@@ -47,3 +47,14 @@ The TypeScript project build should complete without type errors. The Vite produ
 
 - Physical ESP32 / ESP32-S3-CAM capture and face-comparison firmware integration. The device-side firmware is maintained separately; this package defines the backend API contract but does not modify device firmware.
 - Face-recognition accuracy, camera exposure/lighting, liveness detection, concurrent multi-reader operation, and long-duration hardware reliability.
+
+
+## Attendance session and edge-case checks (v4)
+- A verification start is rejected unless exactly one currently open session is resolved, or a valid `session_id` is provided.
+- Naive session timestamps are interpreted as Asia/Ho_Chi_Minh; timezone-aware ISO-8601 timestamps are normalized to UTC.
+- A verification completion is rejected as expired if its session becomes inactive or passes `ends_at` before the face result arrives.
+- The first 10 minutes from `starts_at` are considered present; later successful scans are late. A later scan cannot downgrade an existing present record to late.
+- An `event_id` already present in legacy `scan_events` cannot start a new verification attempt.
+- Re-enabling a student re-enables only that student's latest registered NFC card and latest face template.
+- Setup does not seed demo users by default; `--seed-demo` is an explicit opt-in and seeds only an empty student directory.
+- LAN security script rejects the stock `demo-device-token-change-me` as well as short or placeholder device tokens.

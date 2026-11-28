@@ -10,8 +10,12 @@ PEOPLE=[
 ('23110009','Ngô Gia Phát','CE02'),('23110010','Hoàng Ngọc Lan','CE03'),
 ('23110011','Phan Tuấn Kiệt','CE01'),('23110012','Lý Minh Thư','CE02')]
 def seed(include_scans=False):
+    """Seed fictional data only when the database has no students yet."""
     initialize()
     with connect() as db:
+        # Never repopulate a deliberately cleaned database that already has a sample/real student.
+        if db.execute('SELECT COUNT(*) FROM students').fetchone()[0] > 0:
+            return
         for code,name,cls in PEOPLE:
             db.execute('INSERT OR IGNORE INTO students(full_name,student_code,class_name) VALUES(?,?,?)',(name,code,cls))
         for i,(code,_,_) in enumerate(PEOPLE,1):

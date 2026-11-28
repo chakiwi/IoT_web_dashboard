@@ -6,7 +6,7 @@ echo === ATTENDA - CAI DAT LAN DAU ===
 echo.
 if not exist ".env" (
   copy /y ".env.example" ".env" >nul
-  echo [OK] Tao .env tu cau hinh demo
+  echo [OK] Tao .env voi DEMO_MODE=false (khong tu them du lieu demo)
 )
 if not exist ".venv\Scripts\python.exe" (
   where py >nul 2>nul

@@ -21,14 +21,23 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from database.db import connect, initialize, normalize_uid, record_scan, utc_now
+from database.db import (
+    connect,
+    datetime_to_utc_iso,
+    initialize,
+    normalize_uid,
+    parse_datetime_utc,
+    record_scan,
+    session_is_open,
+    utc_now,
+)
 from database.seed import seed
 
 VN_TZ = timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
 ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT / ".env", override=False)
 WEB_DIST = ROOT / "frontend" / "dist"
-DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in ("1", "true", "yes")
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes")
 USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 PASSWORD = os.getenv("ADMIN_PASSWORD", "attenda123")
 SECRET = os.getenv("APP_SECRET", "dev-only-change-before-LAN").encode()
@@ -168,10 +177,26 @@ class Face(BaseModel):
 
 
 class Session(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=160)
     starts_at: str
     ends_at: str
     is_active: bool = True
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Tên buổi điểm danh không được để trống")
+        return value
+
+    @field_validator("starts_at", "ends_at")
+    @classmethod
+    def normalize_session_time(cls, value: str) -> str:
+        try:
+            return datetime_to_utc_iso(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class VerificationStart(BaseModel):
@@ -229,7 +254,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Attenda Attendance API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Attenda Attendance API", version="4.0.0", lifespan=lifespan)
 
 
 @app.get("/api/v1/health")
@@ -282,15 +307,32 @@ async def edit_student(student_id: int, payload: StudentUpdate, _: str = Depends
     try:
         with connect() as db:
             with db:
-                cursor = db.execute(
+                previous = db.execute("SELECT is_active FROM students WHERE id=?", (student_id,)).fetchone()
+                if not previous:
+                    raise HTTPException(404, "Không tìm thấy sinh viên")
+                db.execute(
                     "UPDATE students SET full_name=?,student_code=?,class_name=?,is_active=? WHERE id=?",
                     (payload.full_name.strip(), payload.student_code.strip(), payload.class_name.strip(), int(payload.is_active), student_id),
                 )
-                if not cursor.rowcount:
-                    raise HTTPException(404, "Không tìm thấy sinh viên")
                 if not payload.is_active:
                     db.execute("UPDATE nfc_cards SET is_active=0 WHERE student_id=?", (student_id,))
                     db.execute("UPDATE face_templates SET is_active=0 WHERE student_id=?", (student_id,))
+                elif not previous["is_active"]:
+                    # Reactivate only the most recently registered card and latest face template.
+                    latest_card = db.execute(
+                        "SELECT id FROM nfc_cards WHERE student_id=? ORDER BY registered_at DESC,id DESC LIMIT 1",
+                        (student_id,),
+                    ).fetchone()
+                    if latest_card:
+                        db.execute("UPDATE nfc_cards SET is_active=0 WHERE student_id=?", (student_id,))
+                        db.execute("UPDATE nfc_cards SET is_active=1 WHERE id=?", (latest_card["id"],))
+                    latest_face = db.execute(
+                        "SELECT id FROM face_templates WHERE student_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+                        (student_id,),
+                    ).fetchone()
+                    if latest_face:
+                        db.execute("UPDATE face_templates SET is_active=0 WHERE student_id=?", (student_id,))
+                        db.execute("UPDATE face_templates SET is_active=1,updated_at=? WHERE id=?", (utc_now(), latest_face["id"]))
     except sqlite3.IntegrityError as exc:
         raise HTTPException(409, "Mã sinh viên đã tồn tại") from exc
     await hub.send("students.changed")
@@ -579,23 +621,41 @@ async def retry_registration_capture(registration_id: str, _: str = Depends(admi
 
 
 def expire_stale_verifications() -> None:
-    now = utc_now()
+    now_text = utc_now()
+    now_dt = datetime.now(timezone.utc)
     with connect() as db:
         with db:
-            db.execute(
-                "UPDATE verification_attempts SET status='expired',completed_at=? WHERE status='pending' AND expires_at<?",
-                (now, now),
-            )
+            pending = db.execute(
+                "SELECT event_id,session_id,expires_at FROM verification_attempts WHERE status='pending'"
+            ).fetchall()
+            for attempt in pending:
+                session = db.execute(
+                    "SELECT * FROM attendance_sessions WHERE id=?", (attempt["session_id"],)
+                ).fetchone() if attempt["session_id"] is not None else None
+                expired = attempt["expires_at"] < now_text or not session or not session_is_open(session, now_dt)
+                if expired:
+                    db.execute(
+                        "UPDATE verification_attempts SET status='expired',completed_at=? WHERE event_id=? AND status='pending'",
+                        (now_text, attempt["event_id"]),
+                    )
 
 
-def resolve_session(db: sqlite3.Connection, session_id: int | None) -> int | None:
+def resolve_session(db: sqlite3.Connection, session_id: int | None) -> int:
+    """Resolve exactly one session that is explicitly active and inside its time window."""
+    now = datetime.now(timezone.utc)
     if session_id is not None:
-        session = db.execute("SELECT id FROM attendance_sessions WHERE id=? AND is_active=1", (session_id,)).fetchone()
-        if not session:
-            raise HTTPException(409, "Buổi điểm danh không tồn tại hoặc đã kết thúc")
+        session = db.execute("SELECT * FROM attendance_sessions WHERE id=?", (session_id,)).fetchone()
+        if not session or not session_is_open(session, now):
+            raise HTTPException(409, "Buổi điểm danh chưa bắt đầu, đã kết thúc hoặc đã bị đóng")
         return session_id
-    active = db.execute("SELECT id FROM attendance_sessions WHERE is_active=1 ORDER BY id DESC LIMIT 2").fetchall()
-    return active[0]["id"] if len(active) == 1 else None
+
+    candidates = db.execute("SELECT * FROM attendance_sessions WHERE is_active=1 ORDER BY id DESC").fetchall()
+    active = [session for session in candidates if session_is_open(session, now)]
+    if not active:
+        raise HTTPException(409, "Hiện không có buổi điểm danh nào đang diễn ra")
+    if len(active) > 1:
+        raise HTTPException(409, "Có nhiều buổi điểm danh đang diễn ra; thiết bị cần gửi session_id")
+    return active[0]["id"]
 
 
 def start_failure(db: sqlite3.Connection, payload: VerificationStart, status: str, card_id=None, student_id=None, session_id=None):
@@ -614,17 +674,31 @@ async def start_verification(payload: VerificationStart, x_device_token: str | N
         with db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("UPDATE verification_attempts SET status='expired',completed_at=? WHERE status='pending' AND expires_at<?", (utc_now(), utc_now()))
-            session_id = resolve_session(db, payload.session_id)
             previous = db.execute("SELECT * FROM verification_attempts WHERE event_id=?", (payload.event_id,)).fetchone()
             if previous:
                 if previous["card_uid"] != payload.card_uid:
                     raise HTTPException(409, "event_id đã được sử dụng với UID khác")
                 if previous["status"] == "pending" and previous["expires_at"] >= utc_now():
+                    previous_session = db.execute(
+                        "SELECT * FROM attendance_sessions WHERE id=?", (previous["session_id"],)
+                    ).fetchone() if previous["session_id"] is not None else None
+                    if not previous_session or not session_is_open(previous_session):
+                        db.execute(
+                            "UPDATE verification_attempts SET status='expired',completed_at=? WHERE event_id=?",
+                            (utc_now(), payload.event_id),
+                        )
+                        return {"event_id": payload.event_id, "status": "expired", "created": False}
                     template = db.execute("SELECT face_embedding,embedding_dim,model_name,model_version FROM face_templates WHERE id=? AND is_active=1", (previous["face_template_id"],)).fetchone()
                     if template:
                         return {"event_id": payload.event_id, "status": "pending", "student_id": previous["student_id"], "face_embedding": template["face_embedding"], "embedding_dim": template["embedding_dim"], "model_name": template["model_name"], "model_version": template["model_version"], "expires_at": previous["expires_at"]}
                 return {"event_id": payload.event_id, "status": previous["status"], "created": False}
 
+            # event_id must be globally fresh across verification attempts and legacy scan history.
+            previous_scan = db.execute("SELECT card_uid FROM scan_events WHERE event_id=?", (payload.event_id,)).fetchone()
+            if previous_scan:
+                raise HTTPException(409, "event_id đã tồn tại trong lịch sử quét; thiết bị phải tạo mã mới")
+
+            session_id = resolve_session(db, payload.session_id)
             card = db.execute(
                 """SELECT c.id AS card_id,c.student_id,c.is_active AS card_active,s.is_active AS student_active
                    FROM nfc_cards c JOIN students s ON s.id=c.student_id WHERE c.uid=?""",
@@ -677,7 +751,8 @@ async def complete_verification(payload: VerificationComplete, x_device_token: s
             if attempt["status"] != "pending":
                 return {"event_id": payload.event_id, "status": attempt["status"], "created": False}
             now = utc_now()
-            if attempt["expires_at"] < now:
+            session = db.execute("SELECT * FROM attendance_sessions WHERE id=?", (attempt["session_id"],)).fetchone() if attempt["session_id"] is not None else None
+            if attempt["expires_at"] < now or not session or not session_is_open(session):
                 db.execute("UPDATE verification_attempts SET status='expired',completed_at=? WHERE event_id=?", (now, payload.event_id))
                 status = "expired"
                 created = False
@@ -698,6 +773,8 @@ async def complete_verification(payload: VerificationComplete, x_device_token: s
                     created = False
                 else:
                     scan, created = record_scan(db, payload.event_id, attempt["card_uid"], attempt["session_id"])
+                    if not created:
+                        raise HTTPException(409, "event_id đã được sử dụng trong lịch sử quét; không thể ghi nhận lần xác minh mới")
                     if scan["result"] == "recognized":
                         db.execute(
                             "UPDATE verification_attempts SET status='verified',face_result=1,scan_event_id=?,completed_at=? WHERE event_id=?",
@@ -817,7 +894,7 @@ def get_sessions(_: str = Depends(admin)):
 
 @app.post("/api/v1/sessions", status_code=201)
 def add_session(payload: Session, _: str = Depends(admin)):
-    if payload.ends_at <= payload.starts_at:
+    if parse_datetime_utc(payload.ends_at) <= parse_datetime_utc(payload.starts_at):
         raise HTTPException(400, "Thời gian kết thúc phải sau thời gian bắt đầu")
     with connect() as db:
         with db:

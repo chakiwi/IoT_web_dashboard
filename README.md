@@ -1,4 +1,4 @@
-# Attenda — AIoT Attendance Dashboard
+# Attenda v4 — AIoT Attendance Dashboard
 
 Attenda manages student registration, NFC card inventory, face-template registration, and attendance verification using React + TypeScript, FastAPI, and SQLite.
 
@@ -6,7 +6,7 @@ Attenda manages student registration, NFC card inventory, face-template registra
 
 - Frontend: React, TypeScript, Vite
 - Backend: FastAPI
-- Database: SQLite schema v3
+- Database: SQLite schema v3 (application release v4)
 - Device connection: ESP32 / PN532 and ESP32-S3-CAM through the documented HTTP API
 
 ## Install and run on Windows
@@ -22,7 +22,7 @@ Default demo login after `.env` is created from `.env.example`:
 - Username: `admin`
 - Password: `attenda123`
 
-The setup script does not overwrite an existing `.env`. Review `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `APP_SECRET`, `DEVICE_TOKEN`, and `DEMO_MODE` when using an older project copy. With `DEMO_MODE=true`, the server seeds fictional students and already-assigned demo cards only; it does not seed NFC-only scans that could be mistaken for face-verified check-ins.
+The setup script does not overwrite an existing `.env`. It creates/upgrades the database schema without automatically seeding demo users. Review `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `APP_SECRET`, `DEVICE_TOKEN`, and `DEMO_MODE` when using an older project copy. The provided `.env.example` uses `DEMO_MODE=false`, so startup does not add fictional students. Setup creates/upgrades the schema only. To explicitly seed a fresh empty database with fictional students/cards, run `python -m database.setup --seed-demo`; seeding is skipped when the database already contains at least one student.
 
 ## New student registration
 
@@ -46,7 +46,7 @@ A registration is matched by the actual preloaded card UID, not arrival order. S
 
 NFC-only `POST /api/v1/scans` is disabled to prevent bypassing face verification. See `docs/API_CONTRACT.md` for payloads and responses.
 
-## Database schema v3
+## Database schema v3 (application release v4)
 
 - `students`: approved student profiles.
 - `nfc_cards`: active/inactive cards linked to approved students.
@@ -57,6 +57,18 @@ NFC-only `POST /api/v1/scans` is disabled to prevent bypassing face verification
 - `attendance_sessions`, `scan_events`, `attendance_records`: attendance sessions, verified scans, and attendance outcomes.
 
 On startup, an existing schema v2 database is upgraded by creating the new v3 tables. Existing students, cards, face templates, scan events, and attendance records are retained. Historical schema-v2 NFC-only scan rows are displayed as legacy/unverified history and are not counted as face-verified check-ins. A legacy database with the old `stations` table is backed up before the legacy migration.
+
+## v4 attendance behavior
+
+- Sessions must be explicitly active and within `starts_at <= now < ends_at` when a scan starts and completes. If there is no active session or more than one active session, the device must send a valid `session_id` or the request is rejected.
+- A 10-minute grace period after the session start is counted as `present`; later successful scans are `late`. A later scan cannot downgrade an existing `present` record to `late`.
+- Naive session timestamps are interpreted as Asia/Ho_Chi_Minh; timezone-aware ISO-8601 values are normalized to UTC.
+- `event_id` must be new across both `verification_attempts` and legacy `scan_events`.
+- Re-enabling a disabled student restores only the latest registered card and latest face template.
+
+## Included test database
+
+The included `database/attendance.db` is a clean test starting point: it contains one sample student (`23110001`), that student's original demo card, five unused test UIDs (`AABB0001`–`AABB0005`) in the inventory, and no registration queue rows, attendance sessions, face templates, scan history, verification attempts, or attendance records. The five UIDs are placeholders for software testing only; they are not claims about any physical card.
 
 ## Tests
 

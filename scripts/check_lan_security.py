@@ -10,7 +10,7 @@ secret=os.getenv('APP_SECRET','')
 if len(secret)<32 or secret.startswith('replace-'):
     errors.append('APP_SECRET phai la chuoi ngau nhien >= 32 ky tu')
 device=os.getenv('DEVICE_TOKEN','')
-if len(device)<20 or device.startswith('replace-'):
+if len(device)<20 or device.startswith('replace-') or device in ('demo-device-token-change-me','device-token','changeme'):
     errors.append('DEVICE_TOKEN can doi thanh khoa moi >= 20 ky tu')
 if errors:
     for e in errors: print('[SECURITY]',e)
